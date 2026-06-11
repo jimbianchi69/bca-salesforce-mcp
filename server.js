@@ -87,7 +87,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-  const sf = await getSalesforceConnection();
+  const sf = await getSalesforceConnectionWithRetry();
 
   try {
     if (name === "get_accounts") {
