@@ -1,0 +1,17 @@
+{
+  "name": "bca-salesforce-mcp",
+  "version": "1.0.0",
+  "description": "BCA Financial Group Salesforce MCP Server",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "jsforce": "^3.10.15"
+  }
+}
