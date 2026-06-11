@@ -190,5 +190,33 @@ app.get("/", (req, res) => {
   res.json({ name: "bca-salesforce", version: "1.0.0", mcp_endpoint: baseUrl + "/mcp" });
 });
 
+// OAuth 2.0 metadata endpoint Claude requires
+app.get("/.well-known/oauth-authorization-server", (req, res) => {
+  const baseUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+    ? "https://" + process.env.RAILWAY_PUBLIC_DOMAIN
+    : "http://localhost:" + (process.env.PORT || 3000);
+  res.json({
+    issuer: baseUrl,
+    authorization_endpoint: baseUrl + "/authorize",
+    token_endpoint: baseUrl + "/token",
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+  });
+});
+
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state } = req.query;
+  res.redirect(redirect_uri + "?code=bca-token&state=" + (state || ""));
+});
+
+app.post("/token", express.urlencoded({ extended: true }), (req, res) => {
+  res.json({
+    access_token: "bca-static-token",
+    token_type: "bearer",
+    expires_in: 86400,
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`BCA Salesforce MCP running on port ${PORT}`));
