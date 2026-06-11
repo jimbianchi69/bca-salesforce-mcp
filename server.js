@@ -163,6 +163,7 @@ function buildServer() {
 }
 
 const app = express();
+app.use("/mcp", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 app.post("/mcp", async (req, res) => {
@@ -170,7 +171,8 @@ app.post("/mcp", async (req, res) => {
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     const server = buildServer();
     await server.connect(transport);
-    await transport.handleRequest(req, res, req.body);
+    const body = Buffer.isBuffer(req.body) ? JSON.parse(req.body.toString()) : req.body;
+await transport.handleRequest(req, res, body);
   } catch (err) {
     console.error("MCP error:", err);
     if (!res.headersSent) res.status(500).json({ error: err.message });
