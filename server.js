@@ -477,5 +477,195 @@ app.post("/token", express.urlencoded({ extended: true }), (req, res) => {
   });
 });
 
+// ── MEETING AUTOMATION ENDPOINT ─────────────────────────────────────────────
+// POST /process-meeting
+// Accepts a meeting summary, uses Claude API to match a Salesforce account,
+// logs the activity, and creates tasks — all automatically.
+//
+// Body: {
+//   title: string,           // Meeting title
+//   summary: string,         // Full meeting summary text
+//   participants: string[],  // Attendee names or emails
+//   action_items: string[],  // Raw action items from meeting tool (optional)
+//   date: string,            // YYYY-MM-DD (defaults to today)
+//   source: string,          // "fyxer", "zoom", "manual", etc.
+//   webhook_secret: string   // Must match WEBHOOK_SECRET env var
+// }
+
+app.post("/process-meeting", async (req, res) => {
+  try {
+    // ── Auth check ──────────────────────────────────────────────────────────
+    const { webhook_secret, title, summary, participants = [], action_items = [], date, source = "unknown" } = req.body || {};
+
+    if (!process.env.WEBHOOK_SECRET || webhook_secret !== process.env.WEBHOOK_SECRET) {
+      return res.status(401).json({ error: "Unauthorized: invalid or missing webhook_secret" });
+    }
+    if (!title || !summary) {
+      return res.status(400).json({ error: "Missing required fields: title, summary" });
+    }
+
+    const meetingDate = date || new Date().toISOString().split("T")[0];
+
+    // ── Get Salesforce accounts for matching ────────────────────────────────
+    const sf = await getSalesforceConnectionWithRetry();
+    const accountsResult = await sf.query(
+      `SELECT Id, Name, BillingCity, BillingState, NumberOfEmployees FROM Account ORDER BY LastActivityDate DESC NULLS LAST LIMIT 100`
+    );
+    const accountList = accountsResult.records.map(a =>
+      `${a.Name}${a.BillingCity ? " (" + a.BillingCity + ", " + a.BillingState + ")" : ""}`
+    ).join("\n");
+
+    // ── Call Claude API to match account and extract structured tasks ────────
+    const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01"
+      },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-6",
+        max_tokens: 2000,
+        system: `You are an AI assistant for BCA Financial Group, a boutique employee benefits and retirement plan consulting firm in Boston. 
+Your job is to analyze meeting summaries and return structured data for Salesforce CRM logging.
+You must respond with ONLY valid JSON — no preamble, no explanation, no markdown.`,
+        messages: [{
+          role: "user",
+          content: `Analyze this meeting and return a JSON object with the following structure:
+
+{
+  "salesforce_account": "exact account name from the list below, or null if no match",
+  "confidence": "high | medium | low",
+  "match_reason": "brief explanation of why you matched this account",
+  "activity_subject": "concise meeting subject line for Salesforce (max 80 chars)",
+  "activity_summary": "structured meeting notes for Salesforce activity log — include key topics, decisions, and context. Use plain text with section headers in CAPS.",
+  "tasks": [
+    {
+      "subject": "concise task title (max 80 chars)",
+      "description": "detailed task notes including context from the meeting",
+      "priority": "High | Normal | Low",
+      "due_date": "YYYY-MM-DD or null",
+      "owner": "Jim | Lea | Ava | Natalie | Annie | unspecified"
+    }
+  ]
+}
+
+MEETING TITLE: ${title}
+MEETING DATE: ${meetingDate}
+SOURCE: ${source}
+PARTICIPANTS: ${participants.join(", ")}
+
+MEETING SUMMARY:
+${summary}
+
+RAW ACTION ITEMS FROM MEETING TOOL:
+${action_items.length > 0 ? action_items.join("\n") : "None provided"}
+
+SALESFORCE ACCOUNTS (match the meeting to one of these):
+${accountList}
+
+Rules:
+- Only create tasks for actionable items — not observations or background info
+- Set priority to High if the item is time-sensitive, compliance-related, or client-facing
+- Set due_date based on any deadlines mentioned, otherwise use 7 days from meeting date
+- If no account matches with at least medium confidence, set salesforce_account to null
+- Owner should be "Jim" unless the summary explicitly assigns it to someone else on the BCA team`
+        }]
+      })
+    });
+
+    if (!anthropicResponse.ok) {
+      const errText = await anthropicResponse.text();
+      return res.status(500).json({ error: `Anthropic API error: ${errText}` });
+    }
+
+    const anthropicData = await anthropicResponse.json();
+    const rawContent = anthropicData.content?.[0]?.text || "";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawContent.replace(/```json|```/g, "").trim());
+    } catch (e) {
+      return res.status(500).json({ error: "Failed to parse Claude response", raw: rawContent });
+    }
+
+    const { salesforce_account, confidence, activity_subject, activity_summary, tasks = [] } = parsed;
+
+    // ── If no account matched, return Claude's analysis without writing ─────
+    if (!salesforce_account || confidence === "low") {
+      return res.json({
+        status: "no_match",
+        message: "No Salesforce account matched with sufficient confidence. Review manually.",
+        parsed,
+      });
+    }
+
+    const results = { account: salesforce_account, confidence, activity_logged: null, tasks_created: [] };
+
+    // ── Log activity to Salesforce ───────────────────────────────────────────
+    try {
+      const accountResult = await sf.query(
+        `SELECT Id FROM Account WHERE Name LIKE '%${salesforce_account.replace(/'/g, "\\'")}%' LIMIT 1`
+      );
+      if (accountResult.records.length > 0) {
+        const accountId = accountResult.records[0].Id;
+        const activityPayload = {
+          WhatId: accountId,
+          Subject: activity_subject,
+          Status: "Completed",
+          Priority: "Normal",
+          TaskSubtype: "Call",
+          ActivityDate: meetingDate,
+          Description: activity_summary,
+        };
+        const activityResult = await sf.sobject("Task").create(activityPayload);
+        results.activity_logged = activityResult.success ? activityResult.id : null;
+
+        // ── Create tasks ───────────────────────────────────────────────────
+        for (const task of tasks) {
+          const dueDate = task.due_date || (() => {
+            const d = new Date(meetingDate);
+            d.setDate(d.getDate() + 7);
+            return d.toISOString().split("T")[0];
+          })();
+          const taskPayload = {
+            WhatId: accountId,
+            Subject: task.subject,
+            Status: "Not Started",
+            Priority: task.priority || "Normal",
+            ActivityDate: dueDate,
+            Description: task.description || "",
+          };
+          const taskResult = await sf.sobject("Task").create(taskPayload);
+          if (taskResult.success) {
+            results.tasks_created.push({ subject: task.subject, due_date: dueDate, id: taskResult.id });
+          }
+        }
+      }
+    } catch (sfErr) {
+      results.salesforce_error = sfErr.message;
+    }
+
+    return res.json({ status: "success", results });
+
+  } catch (err) {
+    console.error("process-meeting error:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ── HEALTH CHECK ─────────────────────────────────────────────────────────────
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    version: "3.0.0",
+    endpoints: {
+      mcp: "POST /mcp",
+      process_meeting: "POST /process-meeting",
+      health: "GET /health"
+    }
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`BCA Salesforce MCP running on port ${PORT}`));
